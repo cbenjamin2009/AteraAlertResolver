@@ -9,7 +9,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-BASE_URL = "https://app.atera.com/api/v3"
+BASE_URL = "https://api.atera.com/api/v3"
 TIMEOUT_SECONDS = 30
 ITEMS_IN_PAGE = 50
 
@@ -36,13 +36,52 @@ class ApiResponse:
     text: str
 
 
+def _validated_api_url(path_or_url: str) -> httpx.URL:
+    try:
+        url = httpx.URL(path_or_url)
+        if not url.scheme and not url.host:
+            url = httpx.URL(f"{BASE_URL}/{path_or_url.lstrip('/')}")
+    except httpx.InvalidURL:
+        raise ValueError("Invalid Atera API request URL") from None
+
+    base_url = httpx.URL(BASE_URL)
+    if (
+        (url.scheme, url.host, url.port)
+        != (base_url.scheme, base_url.host, base_url.port)
+        or url.userinfo
+    ):
+        raise ValueError(
+            "Atera API requests must use https://api.atera.com on port 443 "
+            "without embedded credentials"
+        )
+    return url
+
+
+def _pagination_url(next_link: str, current_url: str) -> str:
+    current = _validated_api_url(current_url)
+    try:
+        url = current.join(next_link)
+    except httpx.InvalidURL:
+        raise ValueError("Invalid Atera pagination URL") from None
+
+    # Atera's API can return pagination links using its legacy app hostname.
+    # Rewrite only that HTTPS origin and the same endpoint; never send it a token.
+    if (
+        (url.scheme, url.host, url.port) == ("https", "app.atera.com", None)
+        and not url.userinfo
+        and url.path == current.path
+    ):
+        url = url.copy_with(host=current.host)
+    return str(_validated_api_url(str(url)))
+
+
 class AteraClient:
-    def __init__(self, api_key: Optional[str] = None) -> None:
-        self.api_key = api_key or os.getenv("ATERA_API_KEY", "").strip()
-        if not self.api_key:
-            self.api_key = _load_env_value_from_env_file("ATERA_API_KEY")
-        if not self.api_key:
-            raise ApiError("Missing ATERA_API_KEY in environment")
+    def __init__(self, api_token: Optional[str] = None) -> None:
+        self.api_token = (api_token or os.getenv("ATERA_API_TOKEN", "")).strip()
+        if not self.api_token:
+            self.api_token = _load_env_value_from_env_file("ATERA_API_TOKEN")
+        if not self.api_token:
+            raise ApiError("Missing ATERA_API_TOKEN in environment")
         self.technician_id = _load_optional_int_env("ATERA_TECHNICIAN_ID")
         self.technician_email = _load_optional_str_env("ATERA_TECHNICIAN_EMAIL")
 
@@ -50,7 +89,7 @@ class AteraClient:
 
     def _base_headers(self) -> Dict[str, str]:
         return {
-            "X-API-KEY": self.api_key,
+            "Authorization": f"Bearer {self.api_token}",
             "accept": "application/json",
         }
 
@@ -73,10 +112,12 @@ class AteraClient:
         json_body: Optional[Dict[str, Any]] = None,
         use_update_headers: bool = False,
     ) -> ApiResponse:
-        url = path_or_url if path_or_url.startswith("http") else f"{BASE_URL}{path_or_url}"
+        url = _validated_api_url(path_or_url)
         headers = self._headers_for_update() if use_update_headers else self._base_headers()
 
-        response = self._client.request(method, url, params=params, json=json_body, headers=headers)
+        response = self._client.request(
+            method, url, params=params, json=json_body, headers=headers, follow_redirects=False
+        )
 
         if response.status_code == 429 or 500 <= response.status_code <= 599:
             raise ApiError("Transient API failure", response.status_code, response.text)
@@ -189,7 +230,7 @@ class AteraClient:
                 next_url = None
                 next_params = None
             else:
-                next_url = next_link
+                next_url = _pagination_url(next_link, next_url)
                 next_params = None
 
         return items

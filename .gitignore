@@ -1,6 +1,7 @@
 # Secrets
 .env
 .env.*
+!.env.example
 
 # Python
 .venv/
@@ -12,6 +13,7 @@ __pycache__/
 # Runtime output
 sync.log
 fixtures/*.json
+fixtures/*.log
 
 # OS/editor
 .DS_Store
